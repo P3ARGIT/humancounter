@@ -495,6 +495,48 @@ def load_data(db_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return sessions, events
 
 
+def ensure_db_initialized(db_path: str) -> None:
+    db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            source TEXT NOT NULL,
+            camera_name TEXT,
+            model TEXT NOT NULL,
+            line_config_json TEXT NOT NULL,
+            in_count INTEGER NOT NULL DEFAULT 0,
+            out_count INTEGER NOT NULL DEFAULT 0,
+            inside_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            event_time TEXT NOT NULL,
+            track_id INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            center_x INTEGER NOT NULL,
+            center_y INTEGER NOT NULL,
+            in_count INTEGER NOT NULL,
+            out_count INTEGER NOT NULL,
+            inside_count INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 def apply_filters(
     sessions: pd.DataFrame,
     events: pd.DataFrame,
@@ -578,9 +620,10 @@ def build_dashboard() -> None:
 
     db_path = st.session_state["db_path"]
     preview_path = st.session_state["preview_path"]
-    db_exists = Path(db_path).exists()
-    if not db_exists:
-        st.error(f"Database not found: {db_path}")
+    try:
+        ensure_db_initialized(db_path)
+    except Exception as exc:
+        st.error(f"Unable to initialize database at {db_path}: {exc}")
         st.stop()
 
     sessions, events = load_data(db_path)
