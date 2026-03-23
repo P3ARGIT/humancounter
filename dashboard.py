@@ -16,6 +16,11 @@ import streamlit as st
 from PIL import Image
 from streamlit_autorefresh import st_autorefresh
 
+try:
+    import psycopg2
+except ImportError:  # pragma: no cover - optional at local dev time
+    psycopg2 = None
+
 
 DEFAULT_DB_PATH = "data/human_counter.db"
 DEFAULT_PREVIEW_PATH = "data/live_preview.jpg"
@@ -443,8 +448,32 @@ def draw_sidebar_brand(nintendo_logo: str, total_logo: str) -> None:
     )
 
 
-def load_data(db_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    conn = sqlite3.connect(db_path)
+def normalize_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://") :]
+    return url
+
+
+def resolve_database_target(default_sqlite_path: str) -> tuple[str, str]:
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        return "postgres", normalize_database_url(database_url)
+    return "sqlite", default_sqlite_path
+
+
+def open_db_connection(db_backend: str, db_target: str):
+    if db_backend == "postgres":
+        if psycopg2 is None:
+            raise RuntimeError(
+                "Postgres backend selected but psycopg2 is not installed. "
+                "Install psycopg2-binary and redeploy."
+            )
+        return psycopg2.connect(db_target)
+    return sqlite3.connect(db_target)
+
+
+def load_data(db_backend: str, db_target: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    conn = open_db_connection(db_backend, db_target)
     sessions = pd.read_sql_query(
         """
         SELECT
@@ -495,44 +524,81 @@ def load_data(db_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return sessions, events
 
 
-def ensure_db_initialized(db_path: str) -> None:
-    db_file = Path(db_path)
-    db_file.parent.mkdir(parents=True, exist_ok=True)
+def ensure_db_initialized(db_backend: str, db_target: str) -> None:
+    if db_backend == "sqlite":
+        db_file = Path(db_target)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_file))
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            source TEXT NOT NULL,
-            camera_name TEXT,
-            model TEXT NOT NULL,
-            line_config_json TEXT NOT NULL,
-            in_count INTEGER NOT NULL DEFAULT 0,
-            out_count INTEGER NOT NULL DEFAULT 0,
-            inside_count INTEGER NOT NULL DEFAULT 0
+    conn = open_db_connection(db_backend, db_target)
+
+    if db_backend == "postgres":
+        conn.cursor().execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id BIGSERIAL PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                source TEXT NOT NULL,
+                camera_name TEXT,
+                model TEXT NOT NULL,
+                line_config_json TEXT NOT NULL,
+                in_count INTEGER NOT NULL DEFAULT 0,
+                out_count INTEGER NOT NULL DEFAULT 0,
+                inside_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL,
-            event_time TEXT NOT NULL,
-            track_id INTEGER NOT NULL,
-            direction TEXT NOT NULL,
-            center_x INTEGER NOT NULL,
-            center_y INTEGER NOT NULL,
-            in_count INTEGER NOT NULL,
-            out_count INTEGER NOT NULL,
-            inside_count INTEGER NOT NULL,
-            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        conn.cursor().execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id BIGSERIAL PRIMARY KEY,
+                session_id BIGINT NOT NULL REFERENCES sessions(id),
+                event_time TEXT NOT NULL,
+                track_id BIGINT NOT NULL,
+                direction TEXT NOT NULL,
+                center_x INTEGER NOT NULL,
+                center_y INTEGER NOT NULL,
+                in_count INTEGER NOT NULL,
+                out_count INTEGER NOT NULL,
+                inside_count INTEGER NOT NULL
+            )
+            """
         )
-        """
-    )
+    else:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                source TEXT NOT NULL,
+                camera_name TEXT,
+                model TEXT NOT NULL,
+                line_config_json TEXT NOT NULL,
+                in_count INTEGER NOT NULL DEFAULT 0,
+                out_count INTEGER NOT NULL DEFAULT 0,
+                inside_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                event_time TEXT NOT NULL,
+                track_id INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                center_x INTEGER NOT NULL,
+                center_y INTEGER NOT NULL,
+                in_count INTEGER NOT NULL,
+                out_count INTEGER NOT NULL,
+                inside_count INTEGER NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+
     conn.commit()
     conn.close()
 
@@ -620,13 +686,15 @@ def build_dashboard() -> None:
 
     db_path = st.session_state["db_path"]
     preview_path = st.session_state["preview_path"]
+
+    db_backend, db_target = resolve_database_target(db_path)
     try:
-        ensure_db_initialized(db_path)
+        ensure_db_initialized(db_backend, db_target)
     except Exception as exc:
-        st.error(f"Unable to initialize database at {db_path}: {exc}")
+        st.error(f"Unable to initialize database ({db_backend}) at {db_target}: {exc}")
         st.stop()
 
-    sessions, events = load_data(db_path)
+    sessions, events = load_data(db_backend, db_target)
 
     with st.sidebar:
         draw_sidebar_brand(DEFAULT_NINTENDO_LOGO, DEFAULT_TOTAL_CONCEPT_LOGO)
@@ -669,7 +737,11 @@ def build_dashboard() -> None:
             )
 
         with st.expander("Data Source", expanded=False):
-            new_db_path = st.text_input("SQLite DB path", value=db_path)
+            if db_backend == "postgres":
+                st.info("Database source: Postgres via DATABASE_URL")
+                new_db_path = db_path
+            else:
+                new_db_path = st.text_input("SQLite DB path", value=db_path)
             new_preview_path = st.text_input("Preview image path", value=preview_path, disabled=not preview_enabled)
             manual_refresh = st.button("Manual refresh")
 

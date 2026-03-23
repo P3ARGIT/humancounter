@@ -71,10 +71,27 @@ The app automatically saves data to SQLite each run:
 - `sessions` table: one row per run/session
 - `events` table: one row per `IN`/`OUT` crossing event
 
-Example run with custom DB path and camera label:
+Example run with custom SQLite DB path and camera label:
 
 ```powershell
 python human_counter.py --source 1 --camera-name FrontDoor --db-path data/human_counter.db
+```
+
+### Use shared Postgres for live cloud dashboard
+
+Set `DATABASE_URL` in both places:
+
+1. Render Web Service environment variable (`DATABASE_URL`) pointing to your Render Postgres.
+2. Local counter machine environment variable (`DATABASE_URL`) with the same value.
+
+When `DATABASE_URL` is set, both `human_counter.py` and `dashboard.py` use Postgres automatically.
+`--db-path` remains as a SQLite fallback only when `DATABASE_URL` is not set.
+
+PowerShell example (local counter machine):
+
+```powershell
+$env:DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DBNAME?sslmode=require"
+python human_counter.py --source 1 --camera-name FrontDoor --line-points 0.00 0.48 1.00 0.66 --enter-side negative
 ```
 
 Example run with diagonal line + dashboard live preview image export:
@@ -171,7 +188,9 @@ Sidebar accordion order:
 
 By default it reads:
 
-- `data/human_counter.db`
+- `data/human_counter.db` (SQLite fallback)
+
+If `DATABASE_URL` is set, dashboard uses Postgres instead and ignores the SQLite path field.
 
 You can change the DB path directly in the dashboard sidebar.
 
@@ -204,5 +223,6 @@ Open: `http://localhost:8501`
 
 Deployment notes:
 
-- Mount/persist your `data/` folder so SQLite data survives restarts.
-- If you keep YOLO running on another machine, sync `data/human_counter.db` and preview image to the deployed app location.
+- For real-time cloud dashboard data, set the same `DATABASE_URL` on both local counter and cloud dashboard.
+- If you stay on SQLite mode, mount/persist your `data/` folder so SQLite data survives restarts.
+- Preview images are local files; cloud dashboard preview needs a shared image path or object storage sync.

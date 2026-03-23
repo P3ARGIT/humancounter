@@ -10,6 +10,11 @@ from typing import Deque, Dict, Optional, Tuple
 import cv2
 from ultralytics import YOLO
 
+try:
+    import psycopg2
+except ImportError:  # pragma: no cover - optional at local dev time
+    psycopg2 = None
+
 
 TrackHistory = Dict[int, Deque[Tuple[int, int]]]
 TrackSides = Dict[int, int]
@@ -87,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--db-path",
         type=str,
         default="data/human_counter.db",
-        help="SQLite database path for event logging.",
+        help="SQLite database path for event logging (used only when DATABASE_URL is not set).",
     )
     parser.add_argument(
         "--camera-name",
@@ -218,8 +223,64 @@ def validate_line_points(line_points: Optional[Tuple[float, float, float, float]
         raise ValueError("--line-points endpoints must be different")
 
 
-def init_db(db_path: str) -> sqlite3.Connection:
-    db_file = Path(db_path)
+def normalize_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://") :]
+    return url
+
+
+def resolve_database_target(db_path: str) -> tuple[str, str]:
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        return "postgres", normalize_database_url(database_url)
+    return "sqlite", db_path
+
+
+def init_db(db_backend: str, db_target: str):
+    if db_backend == "postgres":
+        if psycopg2 is None:
+            raise RuntimeError(
+                "Postgres backend selected but psycopg2 is not installed. "
+                "Install psycopg2-binary and retry."
+            )
+        conn = psycopg2.connect(db_target)
+        conn.autocommit = False
+        conn.cursor().execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id BIGSERIAL PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                source TEXT NOT NULL,
+                camera_name TEXT,
+                model TEXT NOT NULL,
+                line_config_json TEXT NOT NULL,
+                in_count INTEGER NOT NULL DEFAULT 0,
+                out_count INTEGER NOT NULL DEFAULT 0,
+                inside_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.cursor().execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id BIGSERIAL PRIMARY KEY,
+                session_id BIGINT NOT NULL REFERENCES sessions(id),
+                event_time TEXT NOT NULL,
+                track_id BIGINT NOT NULL,
+                direction TEXT NOT NULL,
+                center_x INTEGER NOT NULL,
+                center_y INTEGER NOT NULL,
+                in_count INTEGER NOT NULL,
+                out_count INTEGER NOT NULL,
+                inside_count INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        return conn
+
+    db_file = Path(db_target)
     db_file.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_file))
     conn.execute(
@@ -260,55 +321,94 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
 
 def create_session(
-    conn: sqlite3.Connection,
+    conn,
+    db_backend: str,
     source: str,
     camera_name: str,
     model: str,
     line_config: dict,
 ) -> int:
+    started_at = dt.datetime.now().isoformat()
+    line_config_json = json.dumps(line_config)
+
+    if db_backend == "postgres":
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO sessions (started_at, source, camera_name, model, line_config_json)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (started_at, source, camera_name, model, line_config_json),
+        )
+        session_id = int(cur.fetchone()[0])
+        conn.commit()
+        return session_id
+
     cur = conn.execute(
         """
         INSERT INTO sessions (started_at, source, camera_name, model, line_config_json)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (
-            dt.datetime.now().isoformat(),
-            source,
-            camera_name,
-            model,
-            json.dumps(line_config),
-        ),
+        (started_at, source, camera_name, model, line_config_json),
     )
     conn.commit()
     return int(cur.lastrowid)
 
 
-def update_session_counts(conn: sqlite3.Connection, session_id: int, in_count: int, out_count: int):
+def update_session_counts(conn, db_backend: str, session_id: int, in_count: int, out_count: int):
+    inside = in_count - out_count
+    if db_backend == "postgres":
+        conn.cursor().execute(
+            """
+            UPDATE sessions
+            SET in_count = %s, out_count = %s, inside_count = %s
+            WHERE id = %s
+            """,
+            (in_count, out_count, inside, session_id),
+        )
+        conn.commit()
+        return
+
     conn.execute(
         """
         UPDATE sessions
         SET in_count = ?, out_count = ?, inside_count = ?
         WHERE id = ?
         """,
-        (in_count, out_count, in_count - out_count, session_id),
+        (in_count, out_count, inside, session_id),
     )
     conn.commit()
 
 
-def close_session(conn: sqlite3.Connection, session_id: int):
+def close_session(conn, db_backend: str, session_id: int):
+    ended_at = dt.datetime.now().isoformat()
+    if db_backend == "postgres":
+        conn.cursor().execute(
+            """
+            UPDATE sessions
+            SET ended_at = %s
+            WHERE id = %s
+            """,
+            (ended_at, session_id),
+        )
+        conn.commit()
+        return
+
     conn.execute(
         """
         UPDATE sessions
         SET ended_at = ?
         WHERE id = ?
         """,
-        (dt.datetime.now().isoformat(), session_id),
+        (ended_at, session_id),
     )
     conn.commit()
 
 
 def log_event(
-    conn: sqlite3.Connection,
+    conn,
+    db_backend: str,
     session_id: int,
     track_id: int,
     direction: str,
@@ -317,6 +417,40 @@ def log_event(
     in_count: int,
     out_count: int,
 ):
+    event_time = dt.datetime.now().isoformat()
+    inside = in_count - out_count
+
+    if db_backend == "postgres":
+        conn.cursor().execute(
+            """
+            INSERT INTO events (
+                session_id,
+                event_time,
+                track_id,
+                direction,
+                center_x,
+                center_y,
+                in_count,
+                out_count,
+                inside_count
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                session_id,
+                event_time,
+                track_id,
+                direction,
+                center_x,
+                center_y,
+                in_count,
+                out_count,
+                inside,
+            ),
+        )
+        conn.commit()
+        return
+
     conn.execute(
         """
         INSERT INTO events (
@@ -334,14 +468,14 @@ def log_event(
         """,
         (
             session_id,
-            dt.datetime.now().isoformat(),
+            event_time,
             track_id,
             direction,
             center_x,
             center_y,
             in_count,
             out_count,
-            in_count - out_count,
+            inside,
         ),
     )
     conn.commit()
@@ -373,9 +507,11 @@ def main():
             "enter_from": args.enter_from,
         }
 
-    db_conn = init_db(args.db_path)
+    db_backend, db_target = resolve_database_target(args.db_path)
+    db_conn = init_db(db_backend, db_target)
     session_id = create_session(
         db_conn,
+        db_backend=db_backend,
         source=source_text,
         camera_name=args.camera_name,
         model=args.model,
@@ -419,7 +555,10 @@ def main():
     current_day = dt.datetime.now().date()
 
     print("Press 'q' to quit.")
-    print(f"Database: {args.db_path} | session_id={session_id}")
+    if db_backend == "postgres":
+        print(f"Database: postgres via DATABASE_URL | session_id={session_id}")
+    else:
+        print(f"Database: {db_target} | session_id={session_id}")
     print(f"Preview frame file: {preview_frame_path} (every {preview_every_n_frames} frames)")
     if custom_mode:
         x1, y1, x2, y2 = args.line_points
@@ -441,9 +580,10 @@ def main():
 
             now = dt.datetime.now()
             if now.date() != current_day:
-                close_session(db_conn, session_id)
+                close_session(db_conn, db_backend, session_id)
                 session_id = create_session(
                     db_conn,
+                    db_backend=db_backend,
                     source=source_text,
                     camera_name=args.camera_name,
                     model=args.model,
@@ -516,6 +656,7 @@ def main():
                             daily_in_count += 1
                             log_event(
                                 db_conn,
+                                db_backend,
                                 session_id,
                                 track_id,
                                 "IN",
@@ -524,13 +665,16 @@ def main():
                                 session_in_count,
                                 session_out_count,
                             )
-                            update_session_counts(db_conn, session_id, session_in_count, session_out_count)
+                            update_session_counts(
+                                db_conn, db_backend, session_id, session_in_count, session_out_count
+                            )
                             print(f"{dt.datetime.now().isoformat()} | ID {track_id} | IN")
                         elif direction == "OUT":
                             session_out_count += 1
                             daily_out_count += 1
                             log_event(
                                 db_conn,
+                                db_backend,
                                 session_id,
                                 track_id,
                                 "OUT",
@@ -539,7 +683,9 @@ def main():
                                 session_in_count,
                                 session_out_count,
                             )
-                            update_session_counts(db_conn, session_id, session_in_count, session_out_count)
+                            update_session_counts(
+                                db_conn, db_backend, session_id, session_in_count, session_out_count
+                            )
                             print(f"{dt.datetime.now().isoformat()} | ID {track_id} | OUT")
 
                     track_sides[track_id] = current_side
@@ -629,7 +775,7 @@ def main():
         cap.release()
         if writer is not None:
             writer.release()
-        close_session(db_conn, session_id)
+        close_session(db_conn, db_backend, session_id)
         db_conn.close()
         cv2.destroyAllWindows()
 
