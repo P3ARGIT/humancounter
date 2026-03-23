@@ -1,0 +1,23 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app/runtime data
+data/*.db
+data/live_preview*.jpg
+
+# Streamlit local config and secrets
+.streamlit/secrets.toml
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# Model weights (can be downloaded separately)
+*.pt
