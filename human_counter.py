@@ -642,7 +642,9 @@ def main():
                             (cx, cy), args.line_orientation, args.line_position, annotated.shape
                         )
                     previous_side = track_sides.get(track_id)
-                    if previous_side is not None:
+                    # Side 0 means the center is on the line; treat it as transitional to avoid losing
+                    # the previous side and missing a real crossing on the next frame.
+                    if previous_side is not None and previous_side != 0 and current_side != 0:
                         direction = crossing_direction(
                             previous_side,
                             current_side,
@@ -688,7 +690,8 @@ def main():
                             )
                             print(f"{dt.datetime.now().isoformat()} | ID {track_id} | OUT")
 
-                    track_sides[track_id] = current_side
+                    if current_side != 0:
+                        track_sides[track_id] = current_side
 
                     trail = history.setdefault(track_id, collections.deque(maxlen=24))
                     trail.append((cx, cy))
