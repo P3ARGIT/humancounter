@@ -23,7 +23,7 @@ pip install -r requirements.txt
 ### Webcam
 
 ```powershell
-python human_counter.py --source 0 --model yolov8n.pt --line-orientation vertical --line-position 0.5 --enter-from left
+python human_counter.py --source 1 --line-points 0.00 0.48 1.00 0.66 --enter-side negative --camera-name FrontDoor --preview-frame-path live_preview.jpg --preview-every-n-frames 1
 ```
 
 ### Video file
