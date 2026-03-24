@@ -226,3 +226,5 @@ Deployment notes:
 - For real-time cloud dashboard data, set the same `DATABASE_URL` on both local counter and cloud dashboard.
 - If you stay on SQLite mode, mount/persist your `data/` folder so SQLite data survives restarts.
 - Preview images are local files; cloud dashboard preview needs a shared image path or object storage sync.
+
+DATABASE:$env:DATABASE_URL="postgresql://humancounter_db_user:uYCgjU675BnecE1Jh6ff2DKcV98LOwzi@dpg-d70ljhea2pns73b7sl8g-a.frankfurt-postgres.render.com/humancounter_db?sslmode=require"   
