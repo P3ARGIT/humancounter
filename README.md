@@ -161,11 +161,20 @@ $env:DASHBOARD_PASSWORD_HASH="pbkdf2_sha256$260000$...$..."
 python -m streamlit run dashboard.py
 ```
 
+Optional persistent login settings:
+
+```powershell
+$env:DASHBOARD_AUTH_REMEMBER_DAYS="30"
+$env:DASHBOARD_AUTH_SECRET="replace-with-a-long-random-secret"
+```
+
 Notes:
 
 - Authentication is enabled by default.
 - If `DASHBOARD_PASSWORD_HASH` is missing while auth is enabled, dashboard access is blocked.
 - Set `DASHBOARD_AUTH_ENABLED=false` only for trusted local development.
+- `DASHBOARD_AUTH_REMEMBER_DAYS` controls how long "stay signed in" lasts (default: 30 days).
+- Set `DASHBOARD_AUTH_SECRET` in production so auth cookies remain valid across restarts and cannot be forged.
 
 What you get:
 

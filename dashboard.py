@@ -7,13 +7,17 @@ import hmac
 import logging
 import os
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from PIL import Image
+try:
+    import extra_streamlit_components as stx
+except ImportError:  # pragma: no cover - optional at local dev time
+    stx = None
 from streamlit_autorefresh import st_autorefresh
 
 try:
@@ -28,6 +32,9 @@ DEFAULT_NINTENDO_LOGO = "assets/nintendo-logo.png"
 DEFAULT_TOTAL_CONCEPT_LOGO = "assets/total-concept-logo.png"
 DEFAULT_AUTH_USER = "admin"
 DEFAULT_AUTH_ITERATIONS = 260000
+DEFAULT_AUTH_REMEMBER_DAYS = 30
+AUTH_COOKIE_NAME = "human_counter_auth"
+AUTH_QUERY_PARAM = "auth_token"
 LIGHT_THEME = {
     "bg": "#fff6f6",
     "surface": "#ffffff",
@@ -353,12 +360,77 @@ def is_auth_enabled() -> bool:
     return parse_env_bool(os.getenv("DASHBOARD_AUTH_ENABLED"), default=True)
 
 
-def require_auth() -> None:
+def parse_remember_days() -> int:
+    raw_value = os.getenv("DASHBOARD_AUTH_REMEMBER_DAYS", str(DEFAULT_AUTH_REMEMBER_DAYS))
+    try:
+        days = int(raw_value)
+    except ValueError:
+        return DEFAULT_AUTH_REMEMBER_DAYS
+    return max(1, min(365, days))
+
+
+def get_auth_secret(required_user: str, stored_hash: str) -> str:
+    secret = os.getenv("DASHBOARD_AUTH_SECRET", "").strip()
+    if secret:
+        return secret
+    # Backward-compatible fallback so existing deployments work without an extra env var.
+    return hashlib.sha256(f"{required_user}|{stored_hash}".encode("utf-8")).hexdigest()
+
+
+def make_auth_token(required_user: str, secret: str, remember_days: int) -> tuple[str, datetime]:
+    now_utc = datetime.now(timezone.utc)
+    expires_ts = int((now_utc + timedelta(days=remember_days)).timestamp())
+    payload = f"{required_user}|{expires_ts}"
+    signature = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(f"{payload}|{signature}".encode("utf-8")).decode("ascii")
+    # Cookie manager expects a local datetime for browser cookie expiration.
+    cookie_expires_at = datetime.now() + timedelta(days=remember_days)
+    return token, cookie_expires_at
+
+
+def verify_auth_token(token: str, required_user: str, secret: str) -> bool:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        user, expires_ts_str, signature = decoded.split("|", 2)
+        expires_ts = int(expires_ts_str)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return False
+
+    if user != required_user or expires_ts <= int(datetime.now(timezone.utc).timestamp()):
+        return False
+
+    payload = f"{user}|{expires_ts}"
+    expected = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
+def get_cookie_manager():
+    if stx is None:
+        return None
+    return stx.CookieManager(key="auth_cookie_manager")
+
+
+def clear_auth_cookie(cookie_manager) -> None:
+    if cookie_manager is None:
+        return
+    try:
+        cookie_manager.delete(AUTH_COOKIE_NAME, key="delete_auth_cookie")
+    except Exception:
+        cookie_manager.set(
+            AUTH_COOKIE_NAME,
+            "",
+            expires_at=datetime.now() - timedelta(days=1),
+            key="expire_auth_cookie",
+        )
+
+
+def require_auth(cookie_manager) -> None:
     if not is_auth_enabled():
         return
 
     required_user = os.getenv("DASHBOARD_AUTH_USER", DEFAULT_AUTH_USER)
     stored_hash = os.getenv("DASHBOARD_PASSWORD_HASH", "")
+    remember_days = parse_remember_days()
 
     if not stored_hash:
         st.error(
@@ -373,6 +445,28 @@ def require_auth() -> None:
         st.session_state["auth_failed_attempts"] = 0
     if "auth_lockout_until" not in st.session_state:
         st.session_state["auth_lockout_until"] = None
+
+    auth_secret = get_auth_secret(required_user, stored_hash)
+
+    # Query param fallback for browsers that do not persist cookies reliably on local HTTP.
+    token_from_query = st.query_params.get(AUTH_QUERY_PARAM)
+    if token_from_query and verify_auth_token(token_from_query, required_user, auth_secret):
+        st.session_state["auth_ok"] = True
+        st.session_state["auth_failed_attempts"] = 0
+        st.session_state["auth_lockout_until"] = None
+
+    if cookie_manager is not None and not st.session_state["auth_ok"]:
+        # On some mobile browsers, cookie values can appear on the second rerun only.
+        if "auth_cookie_probe_done" not in st.session_state:
+            st.session_state["auth_cookie_probe_done"] = True
+            st.rerun()
+
+        token = cookie_manager.get(AUTH_COOKIE_NAME)
+        if token and verify_auth_token(token, required_user, auth_secret):
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_failed_attempts"] = 0
+            st.session_state["auth_lockout_until"] = None
+            st.session_state["auth_cookie_probe_done"] = False
 
     if st.session_state["auth_ok"]:
         return
@@ -396,6 +490,16 @@ def require_auth() -> None:
             st.session_state["auth_ok"] = True
             st.session_state["auth_failed_attempts"] = 0
             st.session_state["auth_lockout_until"] = None
+            if cookie_manager is not None:
+                token, expires_at = make_auth_token(required_user, auth_secret, remember_days)
+                cookie_manager.set(
+                    AUTH_COOKIE_NAME,
+                    token,
+                    expires_at=expires_at,
+                    key="set_auth_cookie",
+                )
+                st.query_params[AUTH_QUERY_PARAM] = token
+            st.session_state["auth_cookie_probe_done"] = False
             st.rerun()
         else:
             st.session_state["auth_failed_attempts"] += 1
@@ -677,7 +781,8 @@ def build_dashboard() -> None:
     apply_theme_css(theme)
 
     st.title("Human Counter Dashboard")
-    require_auth()
+    cookie_manager = get_cookie_manager()
+    require_auth(cookie_manager)
 
     if "db_path" not in st.session_state:
         st.session_state["db_path"] = DEFAULT_DB_PATH
@@ -769,6 +874,8 @@ def build_dashboard() -> None:
             st.markdown('<div id="sidebar-logout-anchor"></div>', unsafe_allow_html=True)
             if st.button("Logout", key="logout_btn", type="primary"):
                 st.session_state["auth_ok"] = False
+                clear_auth_cookie(cookie_manager)
+                st.query_params.pop(AUTH_QUERY_PARAM, None)
                 st.rerun()
 
     if preview_enabled:

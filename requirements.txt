@@ -6,3 +6,4 @@ pandas>=2.2.0
 plotly>=5.20.0
 streamlit-autorefresh>=1.0.1
 psycopg2-binary>=2.9.9
+extra-streamlit-components>=0.1.71
